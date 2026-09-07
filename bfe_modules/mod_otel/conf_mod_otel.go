@@ -25,6 +25,7 @@ type ConfModOtel struct {
 		Insecure    bool    // Use insecure connection
 		SampleRate  float64 // The rate between 0.0 and 1.0 of requests to trace
 		Enabled     bool    // Whether to enable OpenTelemetry
+		Pinpoint    bool    // Whether to support Pinpoint context propagation
 	}
 
 	Log struct {

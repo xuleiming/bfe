@@ -100,11 +100,17 @@ func (m *ModuleOtel) initTracer() error {
 
 	sampler := sdktrace.ParentBased(sdktrace.TraceIDRatioBased(m.conf.Basic.SampleRate))
 
-	tp = sdktrace.NewTracerProvider(
+	tpOpts := []sdktrace.TracerProviderOption{
 		sdktrace.WithBatcher(exporter),
 		sdktrace.WithResource(res),
 		sdktrace.WithSampler(sampler),
-	)
+	}
+	if m.conf.Basic.Pinpoint {
+		// pinpoint 场景需要支持复用上游 traceId/spanId
+		tpOpts = append(tpOpts, sdktrace.WithIDGenerator(ctxIDGenerator{}))
+	}
+
+	tp = sdktrace.NewTracerProvider(tpOpts...)
 
 	otel.SetTracerProvider(tp)
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
@@ -132,6 +138,16 @@ func (m *ModuleOtel) startTrace(request *bfe_basic.Request) (int, *bfe_http.Resp
 	ctx := context.Background()
 	ctx = otel.GetTextMapPropagator().Extract(ctx, propagation.HeaderCarrier(request.HttpRequest.Header))
 
+	// pinpoint 上下文解析：有上游则复用，无上游则本端作为链路起点生成
+	var pp *pinpointContext
+	if m.conf.Basic.Pinpoint {
+		pp = extractPinpoint(request.HttpRequest.Header)
+		if pp == nil {
+			pp = newRootPinpointContext(m.conf.Basic.ServiceName)
+		}
+		ctx = pp.attachContext(ctx)
+	}
+
 	spanName := spanName(request.HttpRequest)
 	ctx, span := tracer.Start(ctx, spanName,
 		trace.WithSpanKind(trace.SpanKindServer),
@@ -140,6 +156,13 @@ func (m *ModuleOtel) startTrace(request *bfe_basic.Request) (int, *bfe_http.Resp
 	logRequest(span, request)
 
 	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(request.HttpRequest.Header))
+
+	if pp != nil {
+		sampled := span.SpanContext().IsSampled()
+		logPinpoint(span, pp, sampled)
+		injectPinpoint(request.HttpRequest.Header, pp,
+			m.conf.Basic.ServiceName, pinpointRpcName(request.HttpRequest), sampled)
+	}
 
 	request.SetContext(CtxSpan, span)
 
