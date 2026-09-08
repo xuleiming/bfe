@@ -15,23 +15,22 @@
 package mod_otel
 
 // Pinpoint 上下文兼容支持：
-// 参考《detector 堆栈串联逻辑说明》，BFE 作为中间节点完成
-// 上游 pinpoint 上下文的解析复用、向 Detector 的 OTel 上报、
+// 参考《detector 堆栈串联逻辑说明》及《BFE-Pinpoint对接方案》，BFE 作为中间节点完成
+// 上游 pinpoint 上下文的解析复用、向 Detector 的 OTel 上报（attributes）、
 // 以及向下游的 pinpoint header 透传。
+//
+// 注意：pinpoint 的 traceId/spanId 与 OTel span 的 trace_id/span_id 相互独立，
+// OTel 身份字段完全按 OTel 标准逻辑生成，pinpoint ID 仅用于 header 传递和 attributes 上报。
 
 import (
-	"context"
-	cryptorand "crypto/rand"
-	"crypto/sha256"
-	"encoding/binary"
 	"fmt"
 	mrand "math/rand"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/bfenetworks/bfe/bfe_basic"
 	"github.com/bfenetworks/bfe/bfe_http"
 	"go.opentelemetry.io/otel/attribute"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -50,29 +49,29 @@ const (
 	sampledYes = "s1"
 	sampledNo  = "s0"
 
-	attrPinpointTraceID  = "pinpoint.trace_id"
-	attrPinpointSpanID   = "pinpoint.span_id"
-	attrPinpointPSpanID  = "pinpoint.p_span_id"
-	attrPinpointSampled  = "pinpoint.sampled"
-	attrPinpointPAppName = "pinpoint.p_app_name"
-	attrPinpointPAppType = "pinpoint.p_app_type"
-	attrPinpointPRpcName = "pinpoint.p_rpc_name"
+	attrPinpointTraceID   = "pinpoint.trace_id"
+	attrPinpointSpanID    = "pinpoint.span_id"
+	attrPinpointNewSpanID = "pinpoint.new_span_id"
+	attrPinpointPSpanID   = "pinpoint.p_span_id"
+	attrPinpointSampled   = "pinpoint.sampled"
+	attrPinpointPAppName  = "pinpoint.p_app_name"
+	attrPinpointPAppType  = "pinpoint.p_app_type"
+	attrPinpointPRpcName  = "pinpoint.p_rpc_name"
 
 	attrBfeAppType = "bfe.app_type"
 	bfeAppType     = "BFE"
 )
 
-// pinpointContext 保存一次请求关联的 pinpoint 链路上下文
+// pinpointContext 保存一次请求关联的 pinpoint 链路上下文。
+// 注意：其中 ID 仅用于 pinpoint header 传递和 attributes 上报，
+// 不参与 OTel span 的 trace_id/span_id/parent_span_id 生成
 type pinpointContext struct {
-	traceID      string        // pinpoint 原始 TraceID（agentId^agentStartTime^transactionSequence）
-	traceIDHash  trace.TraceID // 映射到 OTel 的 trace_id
-	spanID       int64         // 本端本次请求的 spanId（S0）
-	parentSpanID int64         // 上游的 spanId（S_prev），无上游时为 0
-	hasUpstream  bool          // 是否复用了上游传入的上下文
-	sampledRaw   string        // 上游 Pinpoint-Sampled 原始值（s0/s1），无则为空
-	pAppName     string        // 上游 pAppName（如有）
-	pAppType     string        // 上游 pAppType（如有）
-	pRpcName     string        // 上游 pRpcName（如有）
+	traceID      string // pinpoint 原始 TraceID（agentId^agentStartTime^transactionSequence）
+	spanID       int64  // 上游为 BFE 分配的 spanId（S0），无上游时为 0
+	parentSpanID int64  // 上游自身的 spanId（S_prev），无上游时为 0
+	newSpanID    int64  // BFE 本次为下游生成的 spanId（S_new），即发往下游的 Pinpoint-SpanID
+	hasUpstream  bool   // 是否复用了上游传入的上下文
+	sampledRaw   string // 上游 Pinpoint-Sampled 原始值（s0/s1），无则为空
 }
 
 var (
@@ -100,7 +99,7 @@ func newSpanId() int64 {
 	return id
 }
 
-// nextSpanId 生成下游使用的 spanId，且不与当前 spanId / parentSpanId 重复
+// nextSpanId 生成下游使用的 spanId，且不为 -1、不与当前 spanId / parentSpanId 重复
 func nextSpanId(spanId, parentSpanId int64) int64 {
 	spanIDRandMu.Lock()
 	defer spanIDRandMu.Unlock()
@@ -112,20 +111,11 @@ func nextSpanId(spanId, parentSpanId int64) int64 {
 	return id
 }
 
-// hashTraceId pinpoint TraceID 为字符串，无法直接放入 OTel 128 位 trace_id，
-// 这里做确定性哈希映射，同一 TraceID 映射结果不变
-func hashTraceId(s string) trace.TraceID {
-	sum := sha256.Sum256([]byte(s))
-	var tid trace.TraceID
-	copy(tid[:], sum[:16])
-	return tid
-}
-
-// spanIdToOtel pinpoint spanId 为 64 位长整型，直接编码为 OTel SpanID
-func spanIdToOtel(id int64) trace.SpanID {
-	var sid trace.SpanID
-	binary.BigEndian.PutUint64(sid[:], uint64(id))
-	return sid
+// ensureNewSpanId 惰性生成下游 spanId（重试多个后端时复用同一个，不重新生成）
+func (pp *pinpointContext) ensureNewSpanId() {
+	if pp.newSpanID == 0 {
+		pp.newSpanID = nextSpanId(pp.spanID, pp.parentSpanID)
+	}
 }
 
 func parseSpanId(s string) (int64, bool) {
@@ -148,9 +138,6 @@ func extractPinpoint(h bfe_http.Header) *pinpointContext {
 		traceID:     traceIdStr,
 		hasUpstream: true,
 		sampledRaw:  h.Get(headerSampled),
-		pAppName:    h.Get(headerPAppName),
-		pAppType:    h.Get(headerPAppType),
-		pRpcName:    h.Get(headerPRpcName),
 	}
 
 	// 复用上游为本端分配的 spanId / parentSpanId，缺失或非法时退化为 0
@@ -160,7 +147,8 @@ func extractPinpoint(h bfe_http.Header) *pinpointContext {
 	return pp
 }
 
-// newRootPinpointContext 无上游时 BFE 作为链路起点，自行生成 traceId / spanId
+// newRootPinpointContext 无上游时 BFE 作为链路起点，自行生成 traceId / spanId。
+// agentId 取 BFE 实例名（本端地址 IP:port）
 func newRootPinpointContext(agentId string) *pinpointContext {
 	pp := &pinpointContext{
 		traceID: newTransactionId(agentId),
@@ -180,62 +168,63 @@ func (pp *pinpointContext) sampledFlag() (bool, bool) {
 	return false, false
 }
 
-// otelTraceID 返回映射后的 OTel trace_id
-func (pp *pinpointContext) otelTraceID() trace.TraceID {
-	if !pp.traceIDHash.IsValid() {
-		pp.traceIDHash = hashTraceId(pp.traceID)
-	}
-	return pp.traceIDHash
+// ctxPinpointSampledKey 用于在 Start 前将上游采样标记放入 context，供采样器读取
+type ctxPinpointSampledKey struct{}
+
+// pinpointSampler 采样器包装：上游 Pinpoint-Sampled 为 s0 时丢弃 span（不上报），
+// 其余情况委托内层采样器（ParentBased + SampleRate）
+type pinpointSampler struct {
+	inner sdktrace.Sampler
 }
 
-// attachContext 将 pinpoint 上下文转为 OTel 父 context 或预设 span 身份：
-// - 有上游：以 pinpoint traceId(映射值)/pSpanID 构造 remote 父节点，并预设本端 spanId
-// - 无上游：预设 traceId(映射值)/spanId，本端作为链路起点
-func (pp *pinpointContext) attachContext(ctx context.Context) context.Context {
-	if pp.hasUpstream && pp.parentSpanID != 0 {
-		flags := trace.FlagsSampled
-		if sampled, ok := pp.sampledFlag(); ok && !sampled {
-			flags = trace.TraceFlags(0)
-		}
-		sc := trace.NewSpanContext(trace.SpanContextConfig{
-			TraceID:    pp.otelTraceID(),
-			SpanID:     spanIdToOtel(pp.parentSpanID),
-			TraceFlags: flags,
-			Remote:     true,
-		})
-		ctx = trace.ContextWithRemoteSpanContext(ctx, sc)
-		return context.WithValue(ctx, presetSpanIdKey{}, spanIdToOtel(pp.spanID))
+func (s pinpointSampler) ShouldSample(p sdktrace.SamplingParameters) sdktrace.SamplingResult {
+	if sampled, ok := p.ParentContext.Value(ctxPinpointSampledKey{}).(bool); ok && !sampled {
+		return sdktrace.SamplingResult{Decision: sdktrace.Drop}
 	}
-	// 无有效父节点：整体预设 traceId/spanId
-	return context.WithValue(ctx, presetIdsKey{}, presetIds{
-		traceID: pp.otelTraceID(),
-		spanID:  spanIdToOtel(pp.spanID),
-	})
+	return s.inner.ShouldSample(p)
 }
 
-// logPinpoint 上报 pinpoint 相关 attributes（原始值完整携带，供 Detector 关联）
-func logPinpoint(span trace.Span, pp *pinpointContext, sampled bool) {
+func (s pinpointSampler) Description() string {
+	return "PinpointBased{" + s.inner.Description() + "}"
+}
+
+// pinpointServerAddr 本次请求的 BFE 本端地址（接收该请求的监听地址）
+func pinpointServerAddr(req *bfe_basic.Request) string {
+	if req == nil || req.Connection == nil {
+		return ""
+	}
+	return req.Connection.LocalAddr().String()
+}
+
+// logPinpoint 上报 pinpoint 相关 attributes（原始值完整携带，供 Detector 关联）。
+// appName 为 BFE cluster name（配置项），serverAddr 为本次请求的 BFE 本端地址；
+// sampled 为 OTel 采样决策（情况 B 的 pinpoint.sampled 取值依据）；
+// p_app_name/p_app_type/p_rpc_name 描述 BFE 自身（作为下游的父节点），两种取值情况一致
+func logPinpoint(span trace.Span, pp *pinpointContext, appName string, serverAddr string, sampled bool) {
 	if span == nil || pp == nil {
 		return
 	}
 
 	span.SetAttributes(
 		attribute.String(attrPinpointTraceID, pp.traceID),
-		attribute.String(attrPinpointSpanID, strconv.FormatInt(pp.spanID, 10)),
+		attribute.String(attrPinpointNewSpanID, strconv.FormatInt(pp.newSpanID, 10)),
+		attribute.String(attrPinpointPAppName, appName),
+		attribute.String(attrPinpointPAppType, bfeAppType),
+		attribute.String(attrPinpointPRpcName, serverAddr),
 		attribute.String(attrBfeAppType, bfeAppType),
 	)
 
 	if pp.hasUpstream {
+		// 情况 A：span_id / p_span_id 取上游原值；sampled 透传上游值
 		span.SetAttributes(
+			attribute.String(attrPinpointSpanID, strconv.FormatInt(pp.spanID, 10)),
 			attribute.String(attrPinpointPSpanID, strconv.FormatInt(pp.parentSpanID, 10)),
-			attribute.String(attrPinpointPAppName, pp.pAppName),
-			attribute.String(attrPinpointPAppType, pp.pAppType),
-			attribute.String(attrPinpointPRpcName, pp.pRpcName),
 		)
 		if pp.sampledRaw != "" {
 			span.SetAttributes(attribute.String(attrPinpointSampled, pp.sampledRaw))
 		}
 	} else {
+		// 情况 B：span_id 为空，sampled 按 BFE 采样策略生成
 		if sampled {
 			span.SetAttributes(attribute.String(attrPinpointSampled, sampledYes))
 		} else {
@@ -244,81 +233,24 @@ func logPinpoint(span trace.Span, pp *pinpointContext, sampled bool) {
 	}
 }
 
-// pinpointRpcName 本端向下游发起的接口地址（host+path）
-func pinpointRpcName(r *bfe_http.Request) string {
-	host := r.Host
-	if i := strings.Index(host, ":"); i >= 0 {
-		host = host[:i]
-	}
-	return host + r.URL.Path
-}
-
-// injectPinpoint 向下游请求注入 pinpoint header（复用 traceId，逐跳生成 spanId）
-func injectPinpoint(h bfe_http.Header, pp *pinpointContext, serviceName string, rpcName string, sampled bool) {
+// injectPinpoint 向下游请求注入 pinpoint header（复用 traceId，spanId 每请求只生成一次，
+// 重试多个后端时复用同一个 newSpanID）。
+// appName 为 BFE cluster name（配置项），serverAddr 为本次请求的 BFE 本端地址
+func injectPinpoint(h bfe_http.Header, pp *pinpointContext, appName string, serverAddr string, sampled bool) {
 	if h == nil || pp == nil {
 		return
 	}
 
-	downstreamSpanId := nextSpanId(pp.spanID, pp.parentSpanID)
+	pp.ensureNewSpanId()
 	h.Set(headerTraceID, pp.traceID)
-	h.Set(headerSpanID, strconv.FormatInt(downstreamSpanId, 10))
+	h.Set(headerSpanID, strconv.FormatInt(pp.newSpanID, 10))
 	h.Set(headerPSpanID, strconv.FormatInt(pp.spanID, 10))
-	h.Set(headerPAppName, serviceName)
+	h.Set(headerPAppName, appName)
 	h.Set(headerPAppType, bfeAppType)
-	h.Set(headerPRpcName, rpcName)
+	h.Set(headerPRpcName, serverAddr)
 	if sampled {
 		h.Set(headerSampled, sampledYes)
 	} else {
 		h.Set(headerSampled, sampledNo)
 	}
 }
-
-// presetIdsKey / presetSpanIdKey 用于通过 context 向 IDGenerator 传递预设 span 身份
-type presetIdsKey struct{}
-type presetSpanIdKey struct{}
-
-type presetIds struct {
-	traceID trace.TraceID
-	spanID  trace.SpanID
-}
-
-// ctxIDGenerator 包装 IDGenerator：context 中带预设身份时按预设生成，
-// 否则退回随机生成。用于 pinpoint 场景复用上游 traceId/spanId。
-type ctxIDGenerator struct{}
-
-func (ctxIDGenerator) NewIDs(ctx context.Context) (trace.TraceID, trace.SpanID) {
-	if p, ok := ctx.Value(presetIdsKey{}).(presetIds); ok {
-		return p.traceID, p.spanID
-	}
-	var tid trace.TraceID
-	for {
-		randRead(tid[:])
-		if tid.IsValid() {
-			break
-		}
-	}
-	return tid, ctxIDGenerator{}.NewSpanID(ctx, tid)
-}
-
-func (ctxIDGenerator) NewSpanID(ctx context.Context, traceID trace.TraceID) trace.SpanID {
-	if sid, ok := ctx.Value(presetSpanIdKey{}).(trace.SpanID); ok && sid.IsValid() {
-		return sid
-	}
-	var sid trace.SpanID
-	for {
-		randRead(sid[:])
-		if sid.IsValid() {
-			break
-		}
-	}
-	return sid
-}
-
-func randRead(b []byte) {
-	if _, err := cryptorand.Read(b); err != nil {
-		panic(err)
-	}
-}
-
-// 确保 ctxIDGenerator 满足 sdktrace.IDGenerator 接口
-var _ sdktrace.IDGenerator = ctxIDGenerator{}

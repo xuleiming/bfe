@@ -21,9 +21,9 @@ import (
 	"testing"
 
 	"github.com/bfenetworks/bfe/bfe_http"
+	"go.opentelemetry.io/otel/attribute"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
-	"go.opentelemetry.io/otel/trace"
 )
 
 func TestExtractPinpoint(t *testing.T) {
@@ -32,9 +32,6 @@ func TestExtractPinpoint(t *testing.T) {
 	h.Set(headerSpanID, "881283423232")
 	h.Set(headerPSpanID, "9918273123")
 	h.Set(headerSampled, "s1")
-	h.Set(headerPAppName, "appA")
-	h.Set(headerPAppType, "Java")
-	h.Set(headerPRpcName, "/api/order")
 
 	pp := extractPinpoint(h)
 	if pp == nil {
@@ -63,18 +60,18 @@ func TestExtractPinpoint(t *testing.T) {
 }
 
 func TestNewRootPinpointContext(t *testing.T) {
-	pp := newRootPinpointContext("bfe-test")
+	pp := newRootPinpointContext("10.0.0.1:8080")
 	if pp.hasUpstream {
 		t.Error("hasUpstream should be false")
 	}
 	parts := strings.Split(pp.traceID, "^")
-	if len(parts) != 3 || parts[0] != "bfe-test" {
+	if len(parts) != 3 || parts[0] != "10.0.0.1:8080" {
 		t.Errorf("traceID format wrong: %s", pp.traceID)
 	}
 	if parts[2] != "1" {
 		t.Errorf("first transactionSequence should be 1, got %s", parts[2])
 	}
-	pp2 := newRootPinpointContext("bfe-test")
+	pp2 := newRootPinpointContext("10.0.0.1:8080")
 	if !strings.HasSuffix(pp2.traceID, "^2") {
 		t.Errorf("transactionSequence should increase, got %s", pp2.traceID)
 	}
@@ -83,75 +80,27 @@ func TestNewRootPinpointContext(t *testing.T) {
 	}
 }
 
+func TestEnsureNewSpanId(t *testing.T) {
+	pp := &pinpointContext{spanID: 100, parentSpanID: 200}
+	pp.ensureNewSpanId()
+	if pp.newSpanID == 0 || pp.newSpanID == 100 || pp.newSpanID == 200 {
+		t.Errorf("newSpanID = %d, should be new and not equal to spanId/parentSpanId", pp.newSpanID)
+	}
+	first := pp.newSpanID
+	pp.ensureNewSpanId()
+	if pp.newSpanID != first {
+		t.Error("ensureNewSpanId should not regenerate (retry keeps same spanId)")
+	}
+}
+
 func newTestTracerProvider(sr *tracetest.SpanRecorder) *sdktrace.TracerProvider {
 	return sdktrace.NewTracerProvider(
-		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.AlwaysSample())),
+		sdktrace.WithSampler(pinpointSampler{inner: sdktrace.AlwaysSample()}),
 		sdktrace.WithSpanProcessor(sr),
-		sdktrace.WithIDGenerator(ctxIDGenerator{}),
 	)
 }
 
-func TestSpanIdentityWithUpstream(t *testing.T) {
-	sr := tracetest.NewSpanRecorder()
-	tp := newTestTracerProvider(sr)
-	defer tp.Shutdown(context.Background())
-
-	h := bfe_http.Header{}
-	h.Set(headerTraceID, "appA^1690000000000^123")
-	h.Set(headerSpanID, "881283423232")
-	h.Set(headerPSpanID, "9918273123")
-	h.Set(headerSampled, "s1")
-	pp := extractPinpoint(h)
-
-	ctx := pp.attachContext(context.Background())
-	_, span := tp.Tracer("test").Start(ctx, "test-span")
-	span.End()
-
-	sc := span.SpanContext()
-	if sc.TraceID() != hashTraceId("appA^1690000000000^123") {
-		t.Errorf("trace_id = %s, want hash of pinpoint traceID", sc.TraceID())
-	}
-	if sc.SpanID() != spanIdToOtel(881283423232) {
-		t.Errorf("span_id = %s, want upstream assigned spanId", sc.SpanID())
-	}
-
-	spans := sr.Ended()
-	if len(spans) != 1 {
-		t.Fatalf("ended spans = %d", len(spans))
-	}
-	if spans[0].Parent().SpanID() != spanIdToOtel(9918273123) {
-		t.Errorf("parent_span_id = %s, want upstream pSpanID", spans[0].Parent().SpanID())
-	}
-}
-
-func TestSpanIdentityWithoutUpstream(t *testing.T) {
-	sr := tracetest.NewSpanRecorder()
-	tp := newTestTracerProvider(sr)
-	defer tp.Shutdown(context.Background())
-
-	pp := newRootPinpointContext("bfe-test")
-	ctx := pp.attachContext(context.Background())
-	_, span := tp.Tracer("test").Start(ctx, "test-span")
-	span.End()
-
-	sc := span.SpanContext()
-	if sc.TraceID() != pp.otelTraceID() {
-		t.Errorf("trace_id = %s, want %s", sc.TraceID(), pp.otelTraceID())
-	}
-	if sc.SpanID() != spanIdToOtel(pp.spanID) {
-		t.Errorf("span_id = %s, want %s", sc.SpanID(), spanIdToOtel(pp.spanID))
-	}
-
-	spans := sr.Ended()
-	if len(spans) != 1 {
-		t.Fatalf("ended spans = %d", len(spans))
-	}
-	if spans[0].Parent().SpanID().IsValid() {
-		t.Errorf("root span should have no parent, got %s", spans[0].Parent().SpanID())
-	}
-}
-
-func TestUpstreamNotSampled(t *testing.T) {
+func TestPinpointSamplerUpstreamNotSampled(t *testing.T) {
 	sr := tracetest.NewSpanRecorder()
 	tp := newTestTracerProvider(sr)
 	defer tp.Shutdown(context.Background())
@@ -163,7 +112,10 @@ func TestUpstreamNotSampled(t *testing.T) {
 	h.Set(headerSampled, "s0")
 	pp := extractPinpoint(h)
 
-	ctx := pp.attachContext(context.Background())
+	ctx := context.Background()
+	if sampled, ok := pp.sampledFlag(); ok {
+		ctx = context.WithValue(ctx, ctxPinpointSampledKey{}, sampled)
+	}
 	_, span := tp.Tracer("test").Start(ctx, "test-span")
 	span.End()
 
@@ -175,21 +127,134 @@ func TestUpstreamNotSampled(t *testing.T) {
 	}
 }
 
+func TestPinpointSamplerUpstreamSampled(t *testing.T) {
+	sr := tracetest.NewSpanRecorder()
+	tp := newTestTracerProvider(sr)
+	defer tp.Shutdown(context.Background())
+
+	h := bfe_http.Header{}
+	h.Set(headerTraceID, "appA^1^1")
+	h.Set(headerSpanID, "100")
+	h.Set(headerSampled, "s1")
+	pp := extractPinpoint(h)
+
+	ctx := context.Background()
+	if sampled, ok := pp.sampledFlag(); ok {
+		ctx = context.WithValue(ctx, ctxPinpointSampledKey{}, sampled)
+	}
+	_, span := tp.Tracer("test").Start(ctx, "test-span")
+	span.End()
+
+	if !span.SpanContext().IsSampled() {
+		t.Error("span should be sampled when upstream is s1")
+	}
+	if len(sr.Ended()) != 1 {
+		t.Error("sampled span should be exported")
+	}
+}
+
+func attrValue(attrs []attribute.KeyValue, key string) (string, bool) {
+	for _, a := range attrs {
+		if a.Key == attribute.Key(key) {
+			return a.Value.AsString(), true
+		}
+	}
+	return "", false
+}
+
+func TestLogPinpointWithUpstream(t *testing.T) {
+	sr := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+	defer tp.Shutdown(context.Background())
+
+	h := bfe_http.Header{}
+	h.Set(headerTraceID, "appA^1^1")
+	h.Set(headerSpanID, "100")
+	h.Set(headerPSpanID, "200")
+	h.Set(headerSampled, "s1")
+	pp := extractPinpoint(h)
+	pp.ensureNewSpanId()
+
+	_, span := tp.Tracer("test").Start(context.Background(), "test-span")
+	logPinpoint(span, pp, "bfe-cluster", "10.0.0.1:8080", true)
+	span.End()
+
+	attrs := sr.Ended()[0].Attributes()
+	checks := map[string]string{
+		attrPinpointTraceID:   "appA^1^1",
+		attrPinpointSpanID:    "100",
+		attrPinpointPSpanID:   "200",
+		attrPinpointNewSpanID: strconv.FormatInt(pp.newSpanID, 10),
+		attrPinpointSampled:   "s1",
+		attrPinpointPAppName:  "bfe-cluster",
+		attrPinpointPAppType:  "BFE",
+		attrPinpointPRpcName:  "10.0.0.1:8080",
+		attrBfeAppType:        "BFE",
+	}
+	for k, want := range checks {
+		got, ok := attrValue(attrs, k)
+		if !ok {
+			t.Errorf("attribute %s missing", k)
+		} else if got != want {
+			t.Errorf("attribute %s = %s, want %s", k, got, want)
+		}
+	}
+}
+
+func TestLogPinpointWithoutUpstream(t *testing.T) {
+	sr := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+	defer tp.Shutdown(context.Background())
+
+	pp := newRootPinpointContext("10.0.0.1:8080")
+	pp.ensureNewSpanId()
+
+	_, span := tp.Tracer("test").Start(context.Background(), "test-span")
+	logPinpoint(span, pp, "bfe-cluster", "10.0.0.1:8080", true)
+	span.End()
+
+	attrs := sr.Ended()[0].Attributes()
+
+	// 情况 B：span_id 不上报
+	if _, ok := attrValue(attrs, attrPinpointSpanID); ok {
+		t.Error("pinpoint.span_id should not be reported without upstream")
+	}
+	// p_span_id 不上报
+	if _, ok := attrValue(attrs, attrPinpointPSpanID); ok {
+		t.Error("pinpoint.p_span_id should not be reported without upstream")
+	}
+	checks := map[string]string{
+		attrPinpointTraceID:   pp.traceID,
+		attrPinpointNewSpanID: strconv.FormatInt(pp.newSpanID, 10),
+		attrPinpointSampled:   "s1",
+		attrPinpointPAppName:  "bfe-cluster",
+		attrPinpointPRpcName:  "10.0.0.1:8080",
+	}
+	for k, want := range checks {
+		got, ok := attrValue(attrs, k)
+		if !ok {
+			t.Errorf("attribute %s missing", k)
+		} else if got != want {
+			t.Errorf("attribute %s = %s, want %s", k, got, want)
+		}
+	}
+}
+
 func TestInjectPinpoint(t *testing.T) {
 	pp := &pinpointContext{
 		traceID:      "T1",
 		spanID:       100,
 		parentSpanID: 200,
+		newSpanID:    300,
 	}
 	h := bfe_http.Header{}
-	injectPinpoint(h, pp, "bfe-svc", "example.com/api", true)
+	injectPinpoint(h, pp, "bfe-cluster", "10.0.0.1:8080", true)
 
 	if h.Get(headerTraceID) != "T1" {
 		t.Errorf("Pinpoint-TraceID = %s", h.Get(headerTraceID))
 	}
-	downstreamSid, _ := strconv.ParseInt(h.Get(headerSpanID), 10, 64)
-	if downstreamSid == 100 || downstreamSid == 200 {
-		t.Errorf("downstream spanId should be new, got %d", downstreamSid)
+	if h.Get(headerSpanID) != "300" {
+		t.Errorf("Pinpoint-SpanID = %s, want 300", h.Get(headerSpanID))
 	}
 	if h.Get(headerPSpanID) != "100" {
 		t.Errorf("Pinpoint-pSpanID = %s", h.Get(headerPSpanID))
@@ -197,30 +262,29 @@ func TestInjectPinpoint(t *testing.T) {
 	if h.Get(headerSampled) != "s1" {
 		t.Errorf("Pinpoint-Sampled = %s", h.Get(headerSampled))
 	}
-	if h.Get(headerPAppName) != "bfe-svc" {
+	if h.Get(headerPAppName) != "bfe-cluster" {
 		t.Errorf("Pinpoint-pAppName = %s", h.Get(headerPAppName))
 	}
 	if h.Get(headerPAppType) != "BFE" {
 		t.Errorf("Pinpoint-pAppType = %s", h.Get(headerPAppType))
 	}
-	if h.Get(headerPRpcName) != "example.com/api" {
+	if h.Get(headerPRpcName) != "10.0.0.1:8080" {
 		t.Errorf("Pinpoint-pRpcName = %s", h.Get(headerPRpcName))
 	}
 
-	injectPinpoint(h, pp, "bfe-svc", "example.com/api", false)
+	// 重试场景：第二次注入不重新生成 spanId
+	injectPinpoint(h, pp, "bfe-cluster", "10.0.0.1:8080", false)
+	if h.Get(headerSpanID) != "300" {
+		t.Errorf("Pinpoint-SpanID = %s after retry, want same 300", h.Get(headerSpanID))
+	}
 	if h.Get(headerSampled) != "s0" {
 		t.Errorf("Pinpoint-Sampled = %s, want s0", h.Get(headerSampled))
 	}
-}
 
-func TestSpanIdToOtelRoundTrip(t *testing.T) {
-	sid := spanIdToOtel(-1)
-	if !sid.IsValid() {
-		t.Error("spanId -1 should map to valid otel SpanID")
-	}
-	var buf [8]byte
-	copy(buf[:], sid[:])
-	if trace.SpanID(buf) != sid {
-		t.Error("round trip failed")
+	// newSpanID 未生成时自动惰性生成
+	pp2 := &pinpointContext{traceID: "T2", spanID: 100}
+	injectPinpoint(h, pp2, "bfe-cluster", "10.0.0.1:8080", true)
+	if pp2.newSpanID == 0 || pp2.newSpanID == 100 {
+		t.Errorf("newSpanID = %d, should be generated", pp2.newSpanID)
 	}
 }

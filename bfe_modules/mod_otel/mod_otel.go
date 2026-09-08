@@ -98,19 +98,17 @@ func (m *ModuleOtel) initTracer() error {
 		return fmt.Errorf("failed to create resource: %w", err)
 	}
 
-	sampler := sdktrace.ParentBased(sdktrace.TraceIDRatioBased(m.conf.Basic.SampleRate))
+	sampler := sdktrace.Sampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(m.conf.Basic.SampleRate)))
+	if m.conf.Basic.Pinpoint {
+		// pinpoint 场景：上游 Pinpoint-Sampled 为 s0 时丢弃 span
+		sampler = pinpointSampler{inner: sampler}
+	}
 
-	tpOpts := []sdktrace.TracerProviderOption{
+	tp = sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter),
 		sdktrace.WithResource(res),
 		sdktrace.WithSampler(sampler),
-	}
-	if m.conf.Basic.Pinpoint {
-		// pinpoint 场景需要支持复用上游 traceId/spanId
-		tpOpts = append(tpOpts, sdktrace.WithIDGenerator(ctxIDGenerator{}))
-	}
-
-	tp = sdktrace.NewTracerProvider(tpOpts...)
+	)
 
 	otel.SetTracerProvider(tp)
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
@@ -138,14 +136,23 @@ func (m *ModuleOtel) startTrace(request *bfe_basic.Request) (int, *bfe_http.Resp
 	ctx := context.Background()
 	ctx = otel.GetTextMapPropagator().Extract(ctx, propagation.HeaderCarrier(request.HttpRequest.Header))
 
-	// pinpoint 上下文解析：有上游则复用，无上游则本端作为链路起点生成
+	// pinpoint 上下文解析：有上游则复用，无上游则本端作为链路起点生成。
+	// 注意：pinpoint ID 不影响 OTel span 身份字段，仅用于 attributes 上报和下游 header 传递
 	var pp *pinpointContext
 	if m.conf.Basic.Pinpoint {
 		pp = extractPinpoint(request.HttpRequest.Header)
 		if pp == nil {
-			pp = newRootPinpointContext(m.conf.Basic.ServiceName)
+			agentId := m.conf.Basic.AppName
+			if addr := pinpointServerAddr(request); addr != "" {
+				agentId = addr // BFE 实例名（本端地址 IP:port）
+			}
+			pp = newRootPinpointContext(agentId)
 		}
-		ctx = pp.attachContext(ctx)
+		pp.ensureNewSpanId()
+		if sampled, ok := pp.sampledFlag(); ok {
+			// 上游采样标记传给采样器：s0 时丢弃 span
+			ctx = context.WithValue(ctx, ctxPinpointSampledKey{}, sampled)
+		}
 	}
 
 	spanName := spanName(request.HttpRequest)
@@ -159,9 +166,13 @@ func (m *ModuleOtel) startTrace(request *bfe_basic.Request) (int, *bfe_http.Resp
 
 	if pp != nil {
 		sampled := span.SpanContext().IsSampled()
-		logPinpoint(span, pp, sampled)
-		injectPinpoint(request.HttpRequest.Header, pp,
-			m.conf.Basic.ServiceName, pinpointRpcName(request.HttpRequest), sampled)
+		if pp.hasUpstream && pp.sampledRaw != "" {
+			// 情况 A：Pinpoint-Sampled 按上游值透传
+			sampled = pp.sampledRaw == sampledYes
+		}
+		serverAddr := pinpointServerAddr(request)
+		logPinpoint(span, pp, m.conf.Basic.AppName, serverAddr, span.SpanContext().IsSampled())
+		injectPinpoint(request.HttpRequest.Header, pp, m.conf.Basic.AppName, serverAddr, sampled)
 	}
 
 	request.SetContext(CtxSpan, span)

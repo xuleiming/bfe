@@ -26,6 +26,7 @@ type ConfModOtel struct {
 		SampleRate  float64 // The rate between 0.0 and 1.0 of requests to trace
 		Enabled     bool    // Whether to enable OpenTelemetry
 		Pinpoint    bool    // Whether to support Pinpoint context propagation
+		AppName     string  // BFE cluster name, used as Pinpoint-pAppName
 	}
 
 	Log struct {
@@ -55,5 +56,8 @@ func (cfg *ConfModOtel) SetDefaults() {
 	}
 	if cfg.Basic.SampleRate <= 0 || cfg.Basic.SampleRate > 1 {
 		cfg.Basic.SampleRate = 1.0
+	}
+	if cfg.Basic.AppName == "" {
+		cfg.Basic.AppName = cfg.Basic.ServiceName
 	}
 }
