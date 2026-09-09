@@ -189,7 +189,6 @@ func TestLogPinpointWithUpstream(t *testing.T) {
 		attrPinpointPAppName:  "bfe-cluster",
 		attrPinpointPAppType:  "BFE",
 		attrPinpointPRpcName:  "10.0.0.1:8080",
-		attrBfeAppType:        "BFE",
 	}
 	for k, want := range checks {
 		got, ok := attrValue(attrs, k)
@@ -246,6 +245,7 @@ func TestInjectPinpoint(t *testing.T) {
 		spanID:       100,
 		parentSpanID: 200,
 		newSpanID:    300,
+		hasUpstream:  true,
 	}
 	h := bfe_http.Header{}
 	injectPinpoint(h, pp, "bfe-cluster", "10.0.0.1:8080", true)
@@ -286,5 +286,20 @@ func TestInjectPinpoint(t *testing.T) {
 	injectPinpoint(h, pp2, "bfe-cluster", "10.0.0.1:8080", true)
 	if pp2.newSpanID == 0 || pp2.newSpanID == 100 {
 		t.Errorf("newSpanID = %d, should be generated", pp2.newSpanID)
+	}
+
+	// 情况 B：无上游，Pinpoint-pSpanID 应为空
+	h2 := bfe_http.Header{}
+	pp3 := newRootPinpointContext("10.0.0.1:8080")
+	pp3.ensureNewSpanId()
+	injectPinpoint(h2, pp3, "bfe-cluster", "10.0.0.1:8080", true)
+	if h2.Get(headerPSpanID) != "" {
+		t.Errorf("Pinpoint-pSpanID = %s, want empty for case B", h2.Get(headerPSpanID))
+	}
+	if h2.Get(headerTraceID) != pp3.traceID {
+		t.Errorf("Pinpoint-TraceID = %s, want %s", h2.Get(headerTraceID), pp3.traceID)
+	}
+	if h2.Get(headerSpanID) != strconv.FormatInt(pp3.newSpanID, 10) {
+		t.Errorf("Pinpoint-SpanID = %s, want %d", h2.Get(headerSpanID), pp3.newSpanID)
 	}
 }

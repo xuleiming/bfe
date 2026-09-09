@@ -58,8 +58,7 @@ const (
 	attrPinpointPAppType  = "pinpoint.p_app_type"
 	attrPinpointPRpcName  = "pinpoint.p_rpc_name"
 
-	attrBfeAppType = "bfe.app_type"
-	bfeAppType     = "BFE"
+	bfeAppType = "BFE"
 )
 
 // pinpointContext 保存一次请求关联的 pinpoint 链路上下文。
@@ -211,7 +210,6 @@ func logPinpoint(span trace.Span, pp *pinpointContext, appName string, serverAdd
 		attribute.String(attrPinpointPAppName, appName),
 		attribute.String(attrPinpointPAppType, bfeAppType),
 		attribute.String(attrPinpointPRpcName, serverAddr),
-		attribute.String(attrBfeAppType, bfeAppType),
 	)
 
 	if pp.hasUpstream {
@@ -244,7 +242,10 @@ func injectPinpoint(h bfe_http.Header, pp *pinpointContext, appName string, serv
 	pp.ensureNewSpanId()
 	h.Set(headerTraceID, pp.traceID)
 	h.Set(headerSpanID, strconv.FormatInt(pp.newSpanID, 10))
-	h.Set(headerPSpanID, strconv.FormatInt(pp.spanID, 10))
+	if pp.hasUpstream {
+		// 情况 A：本端 spanId 作为下游的父节点；情况 B 无上游，pSpanID 为空
+		h.Set(headerPSpanID, strconv.FormatInt(pp.spanID, 10))
+	}
 	h.Set(headerPAppName, appName)
 	h.Set(headerPAppType, bfeAppType)
 	h.Set(headerPRpcName, serverAddr)
