@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -91,6 +92,7 @@ func (m *ModuleOtel) initTracer() error {
 		resource.WithAttributes(
 			semconv.ServiceName(m.conf.Basic.ServiceName),
 			semconv.ServiceVersion("1.0.0"),
+			semconv.ServiceInstanceID(getInstanceId()),
 			attribute.String("component", "bfe"),
 		),
 	)
@@ -274,6 +276,15 @@ func (m *ModuleOtel) Init(cbs *bfe_module.BfeCallbacks, whs *web_monitor.WebHand
 func spanName(r *bfe_http.Request) string {
 	host := strings.SplitN(r.Host, ":", 2)[0]
 	return r.Method + " " + host + r.URL.Path
+}
+
+// getInstanceId 返回本实例标识（主机名），作为 resource 的 service.instance.id
+func getInstanceId() string {
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
+		return "unknown"
+	}
+	return hostname
 }
 
 func logRequest(span trace.Span, req *bfe_basic.Request) {
