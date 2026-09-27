@@ -49,14 +49,16 @@ const (
 	sampledYes = "s1"
 	sampledNo  = "s0"
 
-	attrPinpointTraceID   = "pinpoint.trace_id"
-	attrPinpointSpanID    = "pinpoint.span_id"
-	attrPinpointNewSpanID = "pinpoint.new_span_id"
-	attrPinpointPSpanID   = "pinpoint.p_span_id"
-	attrPinpointSampled   = "pinpoint.sampled"
-	attrPinpointPAppName  = "pinpoint.p_app_name"
-	attrPinpointPAppType  = "pinpoint.p_app_type"
-	attrPinpointPRpcName  = "pinpoint.p_rpc_name"
+	// pinpoint attribute key 命名规则（已与 Detector 确认）：
+	// "pinpoint." + header 字段名（去掉 "Pinpoint-" 前缀、保留原有大小写）
+	attrPinpointTraceID   = "pinpoint.TraceID"
+	attrPinpointSpanID    = "pinpoint.SpanID"
+	attrPinpointNewSpanID = "pinpoint.newSpanID"
+	attrPinpointPSpanID   = "pinpoint.pSpanID"
+	attrPinpointSampled   = "pinpoint.Sampled"
+	attrPinpointPAppName  = "pinpoint.pAppName"
+	attrPinpointPAppType  = "pinpoint.pAppType"
+	attrPinpointPRpcName  = "pinpoint.pRpcName"
 
 	bfeAppType = "BFE"
 )
